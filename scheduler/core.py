@@ -45,6 +45,7 @@ class Task:
     attempt: int = field(default=0, compare=False)
     submitted_at: float = field(default_factory=time.monotonic, compare=False)
     completed_at: Optional[float] = field(default=None, compare=False)
+    _done_event: threading.Event = field(default_factory=threading.Event, compare=False)
 
     @staticmethod
     def create(
@@ -84,7 +85,6 @@ class Scheduler:
         self._heap: List[Task] = []       # min-heap by priority
         self._tasks: Dict[str, Task] = {} # task_id → Task
         self._completed: Set[str] = set() # successfully finished task IDs
-        self._futures: Dict[str, Future] = {}
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sched-worker")
         self._shutdown = threading.Event()
         self._dispatcher = threading.Thread(target=self._dispatch_loop, daemon=True, name="sched-dispatcher")
@@ -111,6 +111,7 @@ class Scheduler:
             task = self._tasks.get(task_id)
             if task and task.status == TaskStatus.PENDING:
                 task.status = TaskStatus.CANCELLED
+                task._done_event.set()
                 logger.info("Cancelled task %s", task_id)
                 return True
         return False
@@ -121,10 +122,21 @@ class Scheduler:
 
     def result(self, task_id: str, timeout: Optional[float] = None) -> object:
         """Block until the task completes and return its result (or raise its exception)."""
-        future = self._futures.get(task_id)
-        if future:
-            return future.result(timeout=timeout)
-        raise KeyError(f"Unknown task: {task_id}")
+        task = self._tasks.get(task_id)
+        if not task:
+            raise KeyError(f"Unknown task: {task_id}")
+            
+        if not task._done_event.wait(timeout=timeout):
+            raise TimeoutError(f"Task {task_id} did not complete within timeout")
+            
+        if task.status == TaskStatus.SUCCESS:
+            return task.result
+        elif task.status == TaskStatus.FAILED:
+            raise task.error
+        elif task.status == TaskStatus.CANCELLED:
+            raise RuntimeError(f"Task {task_id} was cancelled")
+        else:
+            raise RuntimeError(f"Unexpected task status: {task.status}")
 
     def shutdown(self, wait: bool = True) -> None:
         self._shutdown.set()
@@ -176,8 +188,7 @@ class Scheduler:
     def _launch(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         task.attempt += 1
-        future = self._executor.submit(self._run_task, task)
-        self._futures[task.task_id] = future
+        self._executor.submit(self._run_task, task)
 
     def _run_task(self, task: Task) -> object:
         try:
@@ -187,6 +198,7 @@ class Scheduler:
             task.completed_at = time.monotonic()
             with self._lock:
                 self._completed.add(task.task_id)
+            task._done_event.set()
             logger.info("Task %s succeeded (attempt %d)", task.task_id, task.attempt)
             return result
         except Exception as exc:
@@ -201,4 +213,5 @@ class Scheduler:
             else:
                 task.status = TaskStatus.FAILED
                 task.completed_at = time.monotonic()
+                task._done_event.set()
                 raise
