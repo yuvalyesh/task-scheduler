@@ -1,10 +1,13 @@
-.PHONY: run test lint
+.PHONY: install run test lint
+
+install:
+	python3 -m pip install -r requirements.txt
 
 run:
-	uvicorn scheduler.api:app --reload --port 8000
+	python3 -m uvicorn scheduler.api:app --reload --port 8000
 
 test:
-	pytest tests/ -v
+	python3 -m pytest tests/ -v
 
 lint:
-	ruff check scheduler/ tests/
+	python3 -m ruff check scheduler/ tests/
